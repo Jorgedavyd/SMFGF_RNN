@@ -3,7 +3,6 @@ from models.utils import map_to_discrete
 from torch.utils.data import Dataset
 from data.preprocessing import *
 from datetime import datetime
-import torch.nn as nn
 import torch
 
 #Interesting intervals to scrap from
@@ -203,3 +202,80 @@ class GeneralDataset(Dataset):
 
         return dict(zip(self.name_list, [*transformed_dscovr, swarm, dst]))
 
+class SecondStageModeling(Dataset):
+    def __init__(self, scrap_date_list, seq_len = timedelta(hours = 2), step_size = timedelta(minutes = 5), dev = timedelta(minutes = 20)):
+        """
+        SWARM to DST
+
+        This method targets DST sequences, we have these parameters:
+        
+        scrap_date_list: List of date intervals where you want to train your model. #lets to better dataset homogeneization
+        seq_len: Sequence length.
+
+        swarm: SWARM satellite object
+        resample_method: Time step size
+        datasets: List of build-in SequentialDataset objects
+
+        resample(resample_method).mean() is set in order to organize the data on identical
+        time intervals
+        
+        """
+        self.name_list = ['swarm_a', 'swarm_b', 'swarm_c', 'dst']
+        swarm = SWARM()
+        scrap_list = [interval_time(x,y, format = '%Y-%m-%d') for x,y in scrap_date_list]
+        ## temp dataset for scalers
+        inputs_temp = []
+        output_temp = []
+        self.datasets = [] # save on Sequential Dataset method
+        swarm_sc =[
+            'A',
+            'B',
+            'C'
+        ]
+        for scrap_date in scrap_list:
+                swarm_scrap = time_shift(scrap_date, dev, seq_len)
+                input_seqs = [swarm.MAG_x(swarm_scrap, letter).resample(step_size).mean().drop(['Longitude', 'Dst', 'Radius', 'Latitude'], axis = 1) for letter in swarm_sc]
+                
+                dst_scrap = dst_time_shift(scrap_date, dev, seq_len)
+                output = Dst(dst_scrap)
+
+                inputs_temp.append(input_seqs)
+                output_temp.append(output)
+
+                self.datasets.append(Swarm2Dst(input_seqs, output, seq_len, step_size))
+            
+        self.input_scalers = []
+        for i in range(len(input_seqs)):
+            temp_input = [input_seqs[i] for input_seqs in inputs_temp]
+            self.input_scalers.append(StandardScaler().fit(pd.concat(temp_input, axis = 0).values))
+
+        self.output_scaler = StandardScaler().fit(pd.concat(output_temp, axis = 0).values.reshape(-1,1))
+    def __len__(self):
+        return sum(len(dataset) for dataset in self.datasets)
+    def __getitem__(self, index):
+        # Determine which dataset the sample belongs to
+        dataset_idx = 0
+        cumulative_length = len(self.datasets[0])
+        while index >= cumulative_length:
+            dataset_idx += 1
+            cumulative_length += len(self.datasets[dataset_idx])
+
+        # Adjust the index relative to the chosen dataset
+        if dataset_idx > 0:
+            index -= sum(len(self.datasets[i]) for i in range(dataset_idx))
+        
+        input_seqs, output = self.datasets[dataset_idx][index]
+        
+        transformed_inputs = []
+        for scaler, data in zip(self.input_scalers, input_seqs):
+            transformed_inputs.append(torch.from_numpy(scaler.transform(data)).to(torch.float32))
+
+        del input_seqs
+
+        transformed_output = torch.from_numpy(self.output_scaler.transform(output)).to(torch.float32)
+
+        del output
+
+        output = [*transformed_inputs, transformed_output]
+        
+        return dict(zip(self.name_list, output))
