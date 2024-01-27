@@ -13,7 +13,7 @@ def create_rnn_config():
     'scheduler_state_dict': None,
   }
   
-def last_config():
+def import_config():
   try:  
     files = os.listdir('./models/models')
     for idx, file in enumerate(files):
