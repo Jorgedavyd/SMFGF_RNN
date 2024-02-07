@@ -2,9 +2,11 @@ from models.utils import get_default_device
 import torch
 import os
 
-def create_rnn_config():
+def create_rnn_config(
+    name_run: str
+):
   return {
-    'name': 'RnnBased_LSTM',
+    'name': name_run,
     'device': get_default_device(),
     'last_epoch': None,
     'global_step_train': 0,

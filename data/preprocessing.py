@@ -1,9 +1,12 @@
 from torchvision.datasets.utils import download_url
 from datetime import datetime, timedelta,date
+from sunpy.net import Fido, attrs as a
 from viresclient import SwarmRequest
-import spacepy.pycdf as pycdf
+import matplotlib.pyplot as plt
+from astropy import units as u
 from bs4 import BeautifulSoup
-from datetime import date
+import spacepy.pycdf as pycdf
+from astropy.io import fits
 import astropy.units as u
 import xarray as xr
 import pandas as pd
@@ -13,6 +16,7 @@ import tarfile
 import zipfile
 import shutil
 import shutil
+import glob
 import gzip
 import csv
 import os
@@ -1080,111 +1084,119 @@ class ACE:
         df = pd.read_csv(csv_file, parse_dates=['datetime'], index_col='datetime')
         return df
     def SWICS(self, scrap_date):
-        csv_file = f'./data/ACE/SWICS/{scrap_date[0]}_{scrap_date[-1]}.csv' #directories
-        try:
-            temp_root = './data/ACE/SWICS/temp' 
-            os.makedirs(temp_root) #create folder
-            phy_obs = ['nH', 'vH','vthH'] #variables#change
-            variables = ['datetime'] + phy_obs
-            with open(csv_file, 'w') as file:
-                file.writelines(','.join(variables) + '\n')
-            for date in scrap_date:
-                url = f'https://cdaweb.gsfc.nasa.gov/sp_phys/data/ace/swics/level_2_cdaweb/swi_h6/{date[:4]}/ac_h6_swi_{date}_v03.cdf'
-                name = date + '.cdf'
-                download_url(url, temp_root, name)
-                cdf_path = os.path.join(temp_root, name)
-                cdf_file = pycdf.CDF(cdf_path)
-                data_columns = []
+        name_lambda = lambda date: f'./data/.../{date}.csv'  
+        temp_root = './data/ACE/SWICS/temp' 
+        os.makedirs(temp_root) #create folder
+        phy_obs = ['nH', 'vH','vthH'] #variables#change
+        variables = ['datetime'] + phy_obs
+        for date in scrap_date:
+            csv_file = name_lambda(date) #directories
+            try:
+                with open(csv_file, 'x') as file:
+                    file.writelines(','.join(variables) + '\n')
+            except FileExistsError:
+                continue
+            url = f'https://cdaweb.gsfc.nasa.gov/sp_phys/data/ace/swics/level_2_cdaweb/swi_h6/{date[:4]}/ac_h6_swi_{date}_v03.cdf'
+            name = date + '.cdf'
+            download_url(url, temp_root, name)
+            cdf_path = os.path.join(temp_root, name)
+            cdf_file = pycdf.CDF(cdf_path)
+            data_columns = []
 
-                for var in phy_obs:
-                    cond = cdf_file[var][:].reshape(-1,1) if len(cdf_file[var][:].shape) == 1 else cdf_file[var][:]
-                    data_columns.append(cond)
+            for var in phy_obs:
+                cond = cdf_file[var][:].reshape(-1,1) if len(cdf_file[var][:].shape) == 1 else cdf_file[var][:]
+                data_columns.append(cond)
 
-                epoch = np.array([str(date.strftime('%Y-%m-%d %H:%M:%S.%f')) for date in cdf_file['Epoch'][:]]).reshape(-1,1)
-                data = np.concatenate(data_columns, axis = 1, dtype =  np.float32)
-                data  = np.concatenate([epoch, data], axis = 1)
-                with open(csv_file, 'a') as file:
-                    np.savetxt(file, data, delimiter=',', fmt='%s')
-                cdf_file.close()
-            shutil.rmtree(temp_root)
-        except FileExistsError:
-            pass
-        df = pd.read_csv(csv_file, parse_dates=['datetime'], index_col='datetime')
+            epoch = np.array([str(date.strftime('%Y-%m-%d %H:%M:%S.%f')) for date in cdf_file['Epoch'][:]]).reshape(-1,1)
+            data = np.concatenate(data_columns, axis = 1, dtype =  np.float32)
+            data  = np.concatenate([epoch, data], axis = 1)
+            with open(csv_file, 'a') as file:
+                np.savetxt(file, data, delimiter=',', fmt='%s')
+            cdf_file.close()
+        shutil.rmtree(temp_root)
+        data = [pd.read_csv(name_lambda(date), parse_dates=['datetime'], index_col = 'datetime') for date in scrap_date]
+        init_date = pd.to_datetime(scrap_date[0], format = '%Y%m%d')
+        end_date  = pd.to_datetime(scrap_date[-1], format = '%Y%m%d')
+        df = pd.concat(data, axis = 0).loc[init_date: end_date]
         return df
     def EPAM(self, scrap_date):
-        csv_file = f'./data/ACE/EPAM/{scrap_date[0]}_{scrap_date[-1]}.csv' #directories
-        try:    
-            temp_root = './data/ACE/EPAM/temp' 
-            phy_obs = [
-                        'P7',
-                        'P8',
-                        'DE1',
-                        'DE2',
-                        'DE3',
-                        'DE4',
-                        'W3',
-                        'W4',
-                        'W5',
-                        'W6',
-                        'W7',
-                        'W8',
-                        'E1p',
-                        'E2p',
-                        'E3p',
-                        'E4p',
-                        'FP5p',
-                        'FP6p',
-                        'FP7p',
-                        'Z2',
-                        'Z2A',
-                        'Z3',
-                        'Z4',
-                        'P1p',
-                        'P2p',
-                        'P3p',
-                        'P4p',
-                        'P5p',
-                        'P6p',
-                        'P7p',
-                        'P8p',
-                        'E4',
-                        'FP5',
-                        'FP6',
-                        'FP7'] #All available readings
-            os.makedirs(temp_root) #create folder
-            variables = ['datetime'] + phy_obs#variables#change
-            with open(csv_file, 'w') as file:
-                file.writelines(','.join(variables) + '\n')
-            for date in scrap_date:
-                version = EPAM_version(date)
-                url = f'https://cdaweb.gsfc.nasa.gov/sp_phys/data/ace/epam/level_2_cdaweb/epm_h1/{date[:4]}/ac_h1_epm_{date}_{version}.cdf'
-                name = date + '.cdf'
-                download_url(url, temp_root, name)
-                cdf_path = os.path.join(temp_root, name)
-                cdf_file = pycdf.CDF(cdf_path)
-                data_columns = []
+        name_lambda = lambda date: f'./data/ACE/EPAM/{date}.csv'
+        temp_root = './data/ACE/EPAM/temp' 
+        phy_obs = [
+                    'P7',
+                    'P8',
+                    'DE1',
+                    'DE2',
+                    'DE3',
+                    'DE4',
+                    'W3',
+                    'W4',
+                    'W5',
+                    'W6',
+                    'W7',
+                    'W8',
+                    'E1p',
+                    'E2p',
+                    'E3p',
+                    'E4p',
+                    'FP5p',
+                    'FP6p',
+                    'FP7p',
+                    'Z2',
+                    'Z2A',
+                    'Z3',
+                    'Z4',
+                    'P1p',
+                    'P2p',
+                    'P3p',
+                    'P4p',
+                    'P5p',
+                    'P6p',
+                    'P7p',
+                    'P8p',
+                    'E4',
+                    'FP5',
+                    'FP6',
+                    'FP7'] #All available readings
+        os.makedirs(temp_root) #create folder
+        variables = ['datetime'] + phy_obs#variables#change
+        for date in scrap_date:
+            csv_file = name_lambda(date) #directories
+            try:
+                with open(csv_file, 'x') as file:
+                    file.writelines(','.join(variables) + '\n')
+            except FileExistsError:
+                continue
+            version = EPAM_version(date)
+            url = f'https://cdaweb.gsfc.nasa.gov/sp_phys/data/ace/epam/level_2_cdaweb/epm_h1/{date[:4]}/ac_h1_epm_{date}_{version}.cdf'
+            name = date + '.cdf'
+            download_url(url, temp_root, name)
+            cdf_path = os.path.join(temp_root, name)
+            cdf_file = pycdf.CDF(cdf_path)
+            data_columns = []
 
-                for var in phy_obs:
-                    cond = cdf_file[var][:].reshape(-1,1) if len(cdf_file[var][:].shape) == 1 else cdf_file[var][:]
-                    data_columns.append(cond)
+            for var in phy_obs:
+                cond = cdf_file[var][:].reshape(-1,1) if len(cdf_file[var][:].shape) == 1 else cdf_file[var][:]
+                data_columns.append(cond)
 
-                epoch = np.array([str(date.strftime('%Y-%m-%d %H:%M:%S.%f')) for date in cdf_file['Epoch'][:]]).reshape(-1,1)
-                data = np.concatenate(data_columns, axis = 1, dtype =  np.float32)
-                data  = np.concatenate([epoch, data], axis = 1)
-                with open(csv_file, 'a') as file:
-                    np.savetxt(file, data, delimiter=',', fmt='%s')
-                cdf_file.close()
-            shutil.rmtree(temp_root)
-        except:
-            pass
-        epam = pd.read_csv(csv_file, parse_dates=['datetime'], index_col = 'datetime')
-        return epam
-    
+            epoch = np.array([str(date.strftime('%Y-%m-%d %H:%M:%S.%f')) for date in cdf_file['Epoch'][:]]).reshape(-1,1)
+            data = np.concatenate(data_columns, axis = 1, dtype =  np.float32)
+            data  = np.concatenate([epoch, data], axis = 1)
+            with open(csv_file, 'a') as file:
+                np.savetxt(file, data, delimiter=',', fmt='%s')
+            cdf_file.close()
+        shutil.rmtree(temp_root)
+        data = [pd.read_csv(name_lambda(date), parse_dates=['datetime'], index_col = 'datetime') for date in scrap_date]
+        init_date = pd.to_datetime(scrap_date[0], format = '%Y%m%d')
+        end_date  = pd.to_datetime(scrap_date[-1], format = '%Y%m%d')
+        df = pd.concat(data, axis = 0).loc[init_date: end_date]
+        return df
+
 """
 DSCOVR Spacecraft
 """
 class DSCOVR:
-    def MAGFC(self, scrap_date: list, level = None, joint = True):
+    def MAGFC(self, scrap_date: list, level = None, joint = False):
         scrap_date = [string.replace('-','') for string in scrap_date]
         os.makedirs('data/compressed', exist_ok=True)
         os.makedirs('data/uncompressed', exist_ok=True)
@@ -1202,7 +1214,7 @@ class DSCOVR:
         for url in url_list:
             root = 'data/compressed'
             filename = url.split('_')[1] + '_'+url.split('_')[3][1:-6]+'.nc.gz'
-            if filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L2/faraday') or filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L1/faraday') or filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L1/magnetometer') or filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L2/magnetometer'):
+            if (filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L2/faraday')) or filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L1/faraday') or filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L1/magnetometer') or filename[:-6]+'.csv' in os.listdir('data/DSCOVR_L2/magnetometer'):
                 continue
             elif filename[:-3] in os.listdir('data/uncompressed'):
                 output_file = os.path.join('data/uncompressed',filename)[:-3]
@@ -1287,10 +1299,10 @@ class DSCOVR:
         m1m_list = []
         for ind_date in scrap_date:
 
-            fc1_list.append(pd.read_csv(f'./data/DSCOVR_L1/faraday/fc1_{ind_date}.csv', index_col=0))
-            mg1_list.append(pd.read_csv(f'./data/DSCOVR_L1/magnetometer/mg1_{ind_date}.csv', index_col=0))
-            f1m_list.append(pd.read_csv(f'./data/DSCOVR_L2/faraday/f1m_{ind_date}.csv', index_col=0))
-            m1m_list.append(pd.read_csv(f'./data/DSCOVR_L2/magnetometer/m1m_{ind_date}.csv', index_col=0))
+            fc1_list.append(pd.read_csv(f'./data/DSCOVR_L1/faraday/fc1_{ind_date}.csv', index_col=0)[['proton_density', 'proton_speed', 'proton_temperature']])
+            mg1_list.append(pd.read_csv(f'./data/DSCOVR_L1/magnetometer/mg1_{ind_date}.csv', index_col=0)[['bx_gsm', 'by_gsm', 'bz_gsm', 'bt']])
+            f1m_list.append(pd.read_csv(f'./data/DSCOVR_L2/faraday/f1m_{ind_date}.csv', index_col=0)[['proton_density', 'proton_speed', 'proton_temperature']])
+            m1m_list.append(pd.read_csv(f'./data/DSCOVR_L2/magnetometer/m1m_{ind_date}.csv', index_col=0)[['bx_gsm', 'by_gsm', 'bz_gsm', 'bt']])
 
         f1m = pd.concat(f1m_list)
         m1m = pd.concat(m1m_list)
@@ -1345,9 +1357,9 @@ def Dst(scrap_date, resample_method = '5T'):
         os.makedirs('data/Dst_index', exist_ok = True)
         month = day[:6]
 
-        if int(str(month)[:4])==int(date.today().year):
+        if int(str(month)[:4])<=int(date.today().year) - 1:
             url = f'https://wdc.kugi.kyoto-u.ac.jp/dst_realtime/{month}/index.html'
-        elif 2017<=int(str(month)[:4])<=int(date.today().year)-1:
+        elif 2017<=int(str(month)[:4])<int(date.today().year)-1:
             url = f'https://wdc.kugi.kyoto-u.ac.jp/dst_provisional/{month}/index.html'
         else:
             url = f'https://wdc.kugi.kyoto-u.ac.jp/dst_final/{month}/index.html'
@@ -1363,3 +1375,147 @@ def Dst(scrap_date, resample_method = '5T'):
             Dst(scrap_date)
         else:
             print('Unable to access the site')
+
+class SDO:
+    def AIA_HMI(self, scrap_date, sample_int: int = 5):
+        """
+        Flares:
+        
+        SDO/AIA 94
+        SDO/AIA 131
+
+        CMEs:
+
+        SDO/AIA 6173 Å
+        SDO/AIA 1600 Å
+        SDO/AIA 171 Å
+        SDO/AIA 193 Å
+
+        """
+        try:
+            query = glob.glob(f'./data/SDO/Joint/*{date_to_name(scrap_date)}**')
+            if len(query) >= 1:
+                return query
+            else:
+                raise FileNotFoundError
+               
+        except FileNotFoundError:
+            
+            wavelengths = [94, 131, 1600, 171, 193]
+            files = {}
+            for wavelength in wavelengths:
+                result = Fido.search(
+                    a.Time(scrap_date[0], scrap_date[-1]),
+                    a.Instrument('AIA'),
+                    a.Wavelength(wavelength * u.Angstrom),
+                    a.Sample(sample_int*u.min),
+                )
+                files[wavelength] = Fido.fetch(result, path =  './data/SDO/AIA', progress = False)
+            
+            files[6000] = Fido.fetch(
+                Fido.search(
+                    a.Time(scrap_date[0], scrap_date[-1]),
+                    a.Instrument('HMI'),
+                    a.Wavelength(6000 * u.Angstrom),
+                    a.Sample(sample_int*u.min),
+                ),
+                path =  './data/SDO/HMI', progress = False
+            )
+            file_paths = lambda x: files.values()[:][x]
+            for i in range(len(file_paths(0))):
+                data = []
+                for file_name in file_paths(i):
+                    with fits.open(file_name) as hdulist:
+                        # Access the data array from the primary HDU
+                        data.append(hdulist[0].data)
+                plt.imsave(f'./data/SDO/Joint/{date_to_name(scrap_date)(i)}', np.concatenate(data, axis = 2))
+    
+def date_to_name(scrap_date: datetime):
+    init_date = datetime.strftime(scrap_date[0], 'YYYY-MM-DD')
+    last_date = datetime.strftime(scrap_date[-1], 'YYYY-MM-DD')
+
+    return lambda x: init_date +'_'+ last_date + str(x) + '.png'
+
+def scrap_date_to_month(scrap_date):
+    return tuple(set([(day[4:6], day[:4]) for day in scrap_date]))
+class OMNI_Data:
+    def HRO2(self, scrap_date):
+        months, years = scrap_date_to_month(scrap_date)
+        temp_root = './data/OMNI/HRO2/temp' 
+        os.makedirs(temp_root) #create folder
+        phy_obs = ['BX_GSE', 'BY_GSE', 'BZ_GSE', 'Mach_num', 'Mgs_mach_num', 'PR-FLX_10', 'PR-FLX_30', 'PR-FLX_60', 
+        'proton_density', 'flow_speed', 'Vx', 'Vy', 'Vz'] ## metadata:https://cdaweb.gsfc.nasa.gov/pub/software/cdawlib/0SKELTABLES/omni_hro2_5min_00000000_v01.skt
+        variables = ['datetime'] + phy_obs #GSE
+        #Instantiate the dates
+        for year in years:
+            for month in months:
+                date = f'{year}-{month}'
+                csv_file = f'./data/OMNI/HRO2/{date}.csv' #directories
+                try:
+                    with open(csv_file, 'x') as file:
+                        file.writelines(','.join(variables) + '\n')
+                except FileExistsError:
+                    continue
+                url = f'https://cdaweb.gsfc.nasa.gov/sp_phys/data/omni/hro2_5min/{date[:4]}/omni_hro2_5min_{date[:6]}01_v01.cdf'
+                name = date + '.cdf'
+                download_url(url, temp_root, name)
+                cdf_path = os.path.join(temp_root, name)
+                cdf_file = pycdf.CDF(cdf_path)
+
+                data_columns = []
+
+                for var in phy_obs:
+                    cond = cdf_file[var][:].reshape(-1,1) if len(cdf_file[var][:].shape) == 1 else cdf_file[var][:]
+                    data_columns.append(cond)
+
+                epoch = np.array([str(date.strftime('%Y-%m-%d %H:%M:%S.%f')) for date in cdf_file['Epoch'][:]]).reshape(-1,1)
+                data = np.concatenate(data_columns, axis = 1, dtype =  np.float32)
+                data  = np.concatenate([epoch, data], axis = 1)
+                with open(csv_file, 'a') as file:
+                    np.savetxt(file, data, delimiter=',', fmt='%s')
+                cdf_file.close()
+        shutil.rmtree(temp_root)
+        data = []
+        for year in years:
+            for month in months:
+                file_csv = f'./data/OMNI/HRO2/{year}-{month}.csv'
+                data.append(pd.read_csv(file_csv, parse_dates = ['datetime'], index_col = 'datetime'))
+        
+        df = pd.concat(data, axis = 0).loc[pd.Timestamp(scrap_date[0]): pd.Timestamp(scrap_date[-1])]
+        return df
+
+
+def CDAWebDefault(scrap_date, name_lambda, phy_obs, variables, url_lambda):
+        temp_root = name_lambda('')[:-4] + 'temp'
+        os.makedirs(temp_root, exist_ok=True)
+        variables = ['datetime'] + variables
+        for date in scrap_date:
+            csv_file = name_lambda(date) #directories
+            try:
+                with open(csv_file, 'x') as file:
+                    file.writelines(','.join(variables) + '\n')
+            except FileExistsError:
+                continue
+            url = url_lambda(date)
+            name = date + '.cdf'
+            download_url(url, temp_root, name)
+            cdf_path = os.path.join(temp_root, name)
+            cdf_file = pycdf.CDF(cdf_path)
+            data_columns = []
+
+            for var in phy_obs:
+                cond = cdf_file[var][:].reshape(-1,1) if len(cdf_file[var][:].shape) == 1 else cdf_file[var][:]
+                data_columns.append(cond)
+
+            epoch = np.array([str(date.strftime('%Y-%m-%d %H:%M:%S.%f')) for date in cdf_file['Epoch'][:]]).reshape(-1,1)
+            data = np.concatenate(data_columns, axis = 1, dtype =  np.float32)
+            data  = np.concatenate([epoch, data], axis = 1)
+            with open(csv_file, 'a') as file:
+                np.savetxt(file, data, delimiter=',', fmt='%s')
+            cdf_file.close()
+        shutil.rmtree(temp_root)
+        data = [pd.read_csv(name_lambda(date), parse_dates=['datetime'], index_col = 'datetime') for date in scrap_date]
+        init_date = pd.to_datetime(scrap_date[0], format = '%Y%m%d')
+        end_date  = pd.to_datetime(scrap_date[-1], format = '%Y%m%d')
+        df = pd.concat(data, axis = 0).loc[init_date: end_date]
+        return df
