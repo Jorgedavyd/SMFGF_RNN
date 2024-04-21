@@ -2,7 +2,7 @@ from models.utils import get_default_device
 import torch
 import os
 
-def create_rnn_config(
+def create_config(
     name_run: str
 ):
   return {
@@ -20,8 +20,8 @@ def import_config():
     files = os.listdir('./models/models')
     for idx, file in enumerate(files):
       print(f'{idx+1}. {file}')
-    config = int(input('Choose the last config: '))
+    config = int(input('Choose the config: '))
     return torch.load(files[config-1])
   except FileNotFoundError:
-    return create_rnn_config()
+    return create_config()
   

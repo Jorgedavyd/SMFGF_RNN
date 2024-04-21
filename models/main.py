@@ -9,27 +9,35 @@ import torch.nn as nn
 import torch
 import os
 
+training_modes = {
+    'pre1l1': 'Pretraining for l1 tabular data model',
+    'pre2l1': 'L1 -> OMNI pretraining',
+    'l1finetune': 'L1 -> Dst',
+    'pre1sdo': 'Reconstruction autoencoder for 2d CNN',
+    'sdofinetune': 'SDO -> Dst'
+}
+
 """
 SEQUENTIAL METHODS FOR REAL TIME GEOMAGNETIC FORECASTING
 
 1. Multimodal Transformer architecture. (DSCOVR ,ACE, SDO) (done)
- - Linear fc
+ - Monte Carlo Sampling Deep Neural Network fc
  - XGBOOST fc
  - Random Forest fc
 2. Transformer architecture. (DSCOVR, ACE) (done)
- - Linear fc
+ - Monte Carlo Sampling Deep Neural Network fc
  - XGBOOST fc
  - Random Forest fc
 3. Multimodal residual RNN-3D CNN based model. (DSCOVR, ACE, SDO) (done)
- - Linear fc
+ - Monte Carlo Sampling Deep Neural Network fc
  - XGBOOST fc
  - Random Forest fc
 4. Residual RNN model. (DSCOVR, ACE) (done)
- - Linear fc
+ - Monte Carlo Sampling Deep Neural Network fc
  - XGBOOST fc
  - Random Forest fc
 5. 3D CNN. (SDO) (almost done)
- - Linear fc
+ - Monte Carlo Sampling Deep Neural Network fc
  - XGBOOST fc
  - Random Forest fc
 """
@@ -108,7 +116,7 @@ class TrainingPhase(nn.Module):
             self.train_epoch.append(metrics)
         elif mode == 'Validation':
             self.val_epoch.append(metrics)
-    @torch.nograd
+    @torch.no_grad()
     def validation_step(
             self,
             batch
@@ -122,10 +130,10 @@ class TrainingPhase(nn.Module):
             criterion,
             lr_sched: torch.optim.lr_scheduler,
             grad_clip: float = False,
-            encoder_forcing: float = True,
-            weights: list = [0.1,0.9]
-
-
+            training_mode: str = 'l2',
+            encoder_forcing: bool = True,
+            weights: list = [0.8,0.2],
+            lambdas: list = [0.1 for _ in range(8)]
     ):
         """
         out_l1
@@ -136,32 +144,62 @@ class TrainingPhase(nn.Module):
         criterion: criterion (encoder forcing == False)
 
         """
-        if encoder_forcing:
-            #computing noise
+        if training_mode == 'joint_finetune':
+            preds = self(batch['img'], batch['tab'])
+            loss = criterion(preds, batch['dst'])
+            self.writer.add_scalars('Training/Loss', {
+                'Weighted class-based Loss': loss.item(),
+            }, self.config['global_step_train'])
+            self.batch_metrics(preds, batch['dst'], 'Training')
+            self.writer.flush()
+        if training_mode == 'joint_swarm':
+            preds = self(batch['img'], batch['tab'])
+            loss = criterion(preds, batch['swarm'], batch['dst'])
+            self.writer.add_scalars('Training/Loss', {
+                'Weighted class-based Loss': loss.item(),
+            }, self.config['global_step_train'])
+            self.batch_metrics(preds, batch['swarm'], 'Training')
+            self.writer.flush()
+        elif training_mode == 'img_autoencoder':
+            preds = self(batch['input'])
+            loss = criterion(preds, batch['target'], batch['dst'])
+            self.writer.add_scalars('Training/Loss', {
+                'Weighted class-based Loss': loss.item(),
+            }, self.config['global_step_train'])
+            self.batch_metrics(preds, batch['target'], 'Training')
+            self.writer.flush()
+        elif training_mode == 'l2':
+            # Weighted criterion towards very noisy samples
             noise = NoiseLoss.compute(batch['l1'], batch['l2'])
-            #Computing forcing loss and features
-            features, forcing_loss = self.forcing_forward(batch, criterion[0], noise) 
-            #to fc layer to get the prediction
-            preds = self.fc(features)         
-            if self.pretraining:
-                priority_loss = criterion[1](preds, batch['target'], batch['dst'])
-            else:
-                priority_loss = criterion[1](preds, batch['target'])
-            loss = forcing_loss*weights[0] + priority_loss*weights[1]
+            preds = self(batch['l1'])
+            loss = criterion(preds, batch['l2'], noise)
             #Add into tensorboard
             self.writer.add_scalars('Training/Loss', {
-                'Weighted Encoder Forcing Loss': forcing_loss.item(),
-                'Weighted Ouptut Loss': priority_loss.item(),
-                'Overall Loss': loss.item()
+                'Weighted Noise-based Loss': loss.item(),
             }, self.config['global_step_train'])
-        else:
-            preds = self(batch)
-            if self.pretraining:
-                loss = criterion(preds, batch['target'], batch['dst']) #ONLY ONE CRITERION
+            self.batch_metrics(preds, batch['l2'], 'Training')
+            self.writer.flush()
+        elif training_mode =='swarm':
+            if encoder_forcing:
+                noise = NoiseLoss.compute(batch['l1'], batch['l2'])
+                preds, forcing_loss = self.forcing_forward(batch, criterion[0], noise)
+                preds = self.fc(preds)
+                priority_loss = criterion[1](preds, batch['swarm'], batch['dst'])
+                loss = priority_loss*weights[0] + forcing_loss*weights[1]
+                self.writer.add_scalars('Training/Loss', {
+                    'Forcing Loss': forcing_loss.item(),
+                    'Priority Loss': priority_loss.item(),
+                    'Overal Loss': loss.item(),
+                }, self.config['global_step_train'])
+                self.batch_metrics(preds, batch['swarm'], 'Training')
+                self.writer.flush()
             else:
-                loss = criterion(preds, batch['target'])
-        self.writer.add_scalars('Training/Loss', {'Weighted Loss': loss} ,self.config['global_step_train'])
-        self.batch_metrics(preds, batch['target'], 'Training')
+                preds = self(batch['l1'])
+                loss = criterion(preds, batch['swarm'], batch['dst'])
+        elif training_mode == 'finetune':
+            preds = self(batch['input'])
+            loss = criterion(batch['input'], batch['dst'])
+        
         #backpropagate
         loss.backward()
         #gradient clipping
@@ -178,7 +216,7 @@ class TrainingPhase(nn.Module):
         self.writer.flush()
         # Global step shift
         self.config['global_step_train'] += 1
-    @torch.no_grad
+    @torch.no_grad()
     def end_of_epoch(self) -> None:
         keys = self.train_history[0].keys() + self.validation_keys[0].keys()
         metrics = [(train_dict.values() + val_dict.values()) for train_dict, val_dict in zip(self.train_history, self.val_history)]
@@ -343,52 +381,6 @@ class Attention(nn.Module):
 Moded attention and other transformer utils
 """
 
-
-class ModedTimeSeriesAttention(nn.Module):
-  def __init__(
-    self,
-    d_model: int,
-    num_heads: int
-  ):
-    super().__init__()
-    """
-    attention = (concat({head_i}_{i=1}^{num_heads})W_fc)^T
-    head_i = softmax(\frac{Q_{i}^{T}K}{\sqrt(d_{k})})V^{T}
-    """
-    # Premises
-    assert (d_model%num_heads == 0), 'k = \frac{hiden_dim}{num_heads} | k \in \mathbb(Z)^{+}'
-    self.num_heads = num_heads
-    self.d_model = d_model
-    self.head_dim = d_model/num_heads
-    # Projections into hidden
-    self.W_q = nn.Linear(d_model, d_model)
-    self.W_k = nn.Linear(d_model, d_model)
-    self.W_v = nn.Linear(d_model, d_model)
-    # fc projection
-    self.W_fc = nn.Linear(self.head_dim*num_heads, d_model)
-  def forward(self, queries, keys, values, mask = None):
-    #Dimensions
-    B,S,_ = queries.shape
-    #Linear projection
-    Q = self.W_q(queries)
-    K = self.W_k(keys)
-    V = self.W_v(values)
-    # (B,S,d_model) ->(B,S,num_heads, head_dim)
-
-    # Q = Q^T, K = K^T, V = V^T so that attention = soft(Q^T K / sqrt(d_k))V^T -> (B, num_heads, head_dim, seq_len)
-    Q_time = Q.view(B,S,self.num_heads, self.head_dim).transpose(1,2).transpose(-1,-2)
-    K_time = K.view(B,S,self.num_heads, self.head_dim).transpose(1,2).transpose(-1,-2) #SOLVE
-    V_time = V.view(B,S,self.num_heads, self.head_dim).transpose(1,2).transpose(-1,-2)
-
-    # (B,num_heads, head_dim, S)-> (B,num_heads, S, head_dim) -> (B,S,num_heads, head_dim)
-    out_time = Attention.flashattention(Q_time,K_time,V_time, scale = sqrt(self.d_model)).view(B,S,self.num_heads*self.head_dim)
-
-    # (B,S,num_heads, head_dim) -> (B,S,hidden_dim)
-    stan_out = Attention.flashattention(Q,K,V, mask, scale = sqrt(self.d_model)).view(B,S,self.num_heads*self.head_dim)
-
-    out = out_time + stan_out
-
-    return self.W_fc(out)
     
 class PreNormResidual(nn.Module):
   def __init__(
@@ -436,254 +428,30 @@ class GRU(nn.Module):
             hn = torch.zeros(self.num_layers * (2 if self.gru.bidirectional else 1), batch_size, self.hidden_size, requires_grad=True)
         out, _ = self.gru(x, hn)
         return out
-
 """
-Image Analysis
+Monte Carlo Sampling with fc layer
 """
-
-class FeatureExtractorResnet50(nn.Module):
-    def __init__(self, hidden_state_size: int, architecture: tuple, hidden_activations: tuple):
+class MonteCarloFC(nn.Module):
+    def __init__(
+            self,
+            fc_layer,
+            dropout: float = 0.2,
+            n_sampling: int = 5
+    ):
         super().__init__()
-        from torchvision.models import resnet50, ResNet50_Weights
-
-        self.model = resnet50(weights = ResNet50_Weights)
-        
-        self.model.fc = DeepNeuralNetwork(1280, hidden_state_size, architecture, hidden_activations)
-        
-        self.transform = tt.Compose([tt.ToTensor(), ResNet50_Weights.IMAGENET1K_V2.transforms(antialias = True)])
+        self.n_sampling = n_sampling
+        self.fc = fc_layer
+        self.dropout = dropout
     def forward(self, x):
-        out = self.model(x)
+        outputs = []
+        for _ in range(self.n_sampling):
+            self.train()
+            x = self.dropout(x)
+            self.eval()
+            outputs.append(self.fc(x))
+        out = torch.mean(torch.stack(outputs, dim = 0), dim = 0)
         return out
 
-class FeatureExtractorVGG19(nn.Module):
-    def __init__(self, hidden_state_size: int, architecture: tuple, hidden_activations: tuple):
-        super().__init__()
-        from torchvision.models import vgg19, VGG19_Weights
-
-        self.model = vgg19(weights = VGG19_Weights)
-
-        self.model.classifier = DeepNeuralNetwork(1280, hidden_state_size, architecture, hidden_activations)
-        
-        self.transform = tt.Compose([tt.ToTensor(), VGG19_Weights.IMAGENET1K_V1.transforms(antialias = True)])
-    def forward(self, x):
-        out = self.model(x)
-        return out
-    
-class GeoVideo(nn.Module):
-    def __init__(self, image_model, rnn):
-        super().__init__()
-        self.feature_extractor = image_model
-        self.sequential_extractor = rnn
-    def forward(self, x):
-        _, seq_length, _,_,_ = x.size()
-        feature_extraction = []
-        
-        #feature extraction
-        for t in range(seq_length):
-            feature_extraction.append(self.feature_extractor(x[:,t,:,:,:]))
-        
-        out = torch.cat(feature_extraction)
-        #sequential analysis
-        out = self.sequential_extractor(out)        
-        return out
-
-## 3D CNN
-    
-class CNN_3D(TrainingPhase):
-    def __init__(
-            self,
-
-    ):
-        super().__init__()
-
-    def forward(
-            self,
-            x
-    ):
-        
-class CNN_2D(TrainingPhase):
-    def __init__(
-            self,
-
-    ):
-        super().__init__()
-
-    def forward(
-            self,
-            x
-    ):
-        
-
-class MC3_18(nn.Module):
-    def __init__(self, hidden_state_size, architecture, hidden_activations, dropout: float = 0.1):
-        from torchvision.models.video import mc3_18, MC3_18_Weights
-        super(MC3_18, self).__init__()
-        # (B, F, H, W) -> (B,F,C,H,W)
-        self.input_layer = 
-
-        self.model = mc3_18(weights = MC3_18_Weights.KINETICS400_V1)
-
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        self.model.fc = nn.Sequential(
-            DeepNeuralNetwork(512, hidden_state_size, architecture, hidden_activations),
-            nn.Dropout(dropout, inplace = True)
-            )
-        self.initial_transform = tt.Compose([
-            tt.ToTensor(),
-            tt.Resize((1024, 1024))
-        ])
-
-        self.intermediate_transform = tt.Compose([
-            MC3_18_Weights.KINETICS400_V1.transforms(antialias = True)
-        ])
-    def forward(self, x):
-        x = self.input_layer(x)
-        x = self.intermediate_transform(x)
-        x = self.model(x)
-        return x
-    
-
-class MVIT_V2_S(nn.Module):
-    def __init__(self, hidden_state_size, architecture, hidden_activations, dropout: float = 0.1):
-        from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights
-        super(MVIT_V2_S, self).__init__()
-
-        self.input_layer = 
-        
-        self.model = mvit_v2_s(weights = MViT_V2_S_Weights.KINETICS400_V1)
-
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        self.model.head = nn.Sequential(
-            DeepNeuralNetwork(768, hidden_state_size, architecture, hidden_activations),
-            nn.Dropout(dropout, inplace = True)
-            )
-        self.initial_transform = tt.Compose([
-            tt.ToTensor(),
-            tt.Resize((1024, 1024))
-        ])
-
-        self.intermediate_transform = tt.Compose([MViT_V2_S_Weights.KINETICS400_V1.transforms(antialias=True)])
-    def forward(self, x):
-        x = self.input_layer(x)
-        x = self.intermediate_transform(x)
-        x = self.model(x)
-        return x
-
-class SWIN3D_B(nn.Module):
-    def __init__(self, hidden_state_size: int, architecture: tuple, hidden_activations: tuple, dropout: float = 0.1):
-        from torchvision.models.video import swin3d_b, Swin3D_B_Weights
-        super(SWIN3D_B, self).__init__()
-
-        self.input_layer = 
-        
-        self.model = swin3d_b(weights = Swin3D_B_Weights.KINETICS400_IMAGENET22K_V1)
-
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        self.model.head = nn.Sequential(
-            DeepNeuralNetwork(1024, hidden_state_size, architecture, hidden_activations),
-            nn.Dropout(dropout, inplace = True)
-            )
-        self.initial_transform = tt.Compose([
-            tt.ToTensor(),
-            tt.Resize((1024, 1024))
-        ])
-        self.intermediate_transform = tt.Compose([Swin3D_B_Weights.KINETICS400_IMAGENET22K_V1.transforms(antialias=True)])
-    def forward(self, x):
-        x = self.input_layer(x)
-        x = self.intermediate_transform(x)
-        x = self.model(x)
-        return x
-
-"""Vision transformer"""
-"""
-General utils for transformers
-"""
-class PatchEmbed_3DCNN(nn.Module):
-    def __init__(
-            self,
-            d_model: int, 
-            h_div: int,
-            w_div: int,
-            pe,
-            feature_extractor,
-            architecture: tuple, 
-            hidden_activations: tuple, 
-            X: torch.Tensor,
-            dropout: float = 0.1,
-    ):
-        super().__init__()
-        """
-        B: batch size
-        F: Frames
-        C: Channels
-        H_div: number of vertical cuts
-        W_div: number of horizontal cuts
-        H_div*W_div: total patches
-        h: H/H_div
-        w: W/W_div
-        """
-        assert (X.size(-2)%self.h_div ==0 or X.size(-1)%self.w_div == 0), 'Patching size must be multiplier of dimention'
-        self.H_div = h_div
-        self.W_div = w_div
-        self.feature_extractor  = feature_extractor(d_model, architecture, hidden_activations, dropout)
-        self.pe = pe
-    def forward(
-            self,
-            X: torch.Tensor()
-    ):
-        B,F,C,H,W = X.shape
-        # -> (B*h_div*w_div, F,C,h, w)
-        X = X.view(-1,F,C, H//self.H_div, W//self.W_div)
-        # -> (B,h_div*w_div, embed_size)
-        out = self.feature_extractor(X).view(B, X.size(0)/B, -1)
-        # -> (B,h_div*w_div, embed_size)
-        X = self.pe(out)
-        return X
-
-class PatchEmbed_2DCNN(nn.Module):
-    def __init__(
-            self,
-            d_model: int, 
-            pe,
-            feature_extractor,
-            architecture: tuple, 
-            hidden_activations: tuple, 
-            dropout: float = 0.1,
-    ):
-        super().__init__()
-        """
-        B: batch size
-        F: Frames
-        C: Channels
-        H_div: number of vertical cuts
-        W_div: number of horizontal cuts
-        H_div*W_div: total patches
-        h: H/H_div
-        w: W/W_div
-        """
-        self.d_model = d_model
-        self.feature_extractor  = feature_extractor(d_model, architecture, hidden_activations, dropout)
-        self.pe = pe
-    def forward(
-            self,
-            X: torch.Tensor()
-    ):
-        B,F,C,H,W = X.shape
-        # -> (B*F,C,H, W)
-        X = X.view(B*F, C, H, W)
-        # -> (B,F, embed_size)
-        out = self.feature_extractor(X).view(B, F, -1)
-        # -> (B,F, embed_size)
-        X = self.pe(out)
-        return X
-        
-    
 
 """
 Rotary Positional Encoder [source](https://arxiv.org/pdf/2104.09864.pdf)
@@ -744,17 +512,25 @@ class RotaryPositionalEncoding(nn.Module):
 Dn Positional Encoding
 Adds the first n-degree derivatives of the samples, creates lineal time dependence.
 """
+class DnPositionalEncoding(nn.Module):
+    def __init__(
+            self,
+            delta_t: timedelta,
+            degree: int = 1,
+            edge_order: int = 1
+    ):
+        super().__init__()
+        self.delta_t = delta_t.total_seconds()
+        self.degree = degree
+        self.edge_order = edge_order
 
-def DnPositionalEncoding(
-        x_n: torch.Tensor,
-        delta_t: float,
-        degree: int = 1,
-):
-    B,_,I = x_n.size()
-    for i in range(1,degree+1):
-        delta_x_n = torch.cat([torch.zeros(B,i,I), (x_n[i:]-x_n[:-i])/delta_t], dim = -2)
-        x_n = x_n + delta_x_n
-    return x_n
+    def forward(self, x_n):
+        out = x_n.clone()
+        for _ in range(1,self.degree+1):
+            x_n = torch.gradient(x_n, spacing = (self.delta_t, ), dim = -1, edge_order=self.edge_order)
+            out += x_n
+        return out
+
 
 """
 MLPs
@@ -782,393 +558,58 @@ class PosWiseFFN(nn.Module):
 class SeqWiseMLP(nn.Module):
     def __init__(
             self,
-            seq_len,
+            seq_len: int,
+            hidden_dim: int,
             activation = nn.SiLU,
     ):
         super().__init__()
         self.activation = activation
-        self.w_1 = nn.Linear(seq_len, seq_len)
-        self.v = nn.Linear(seq_len, seq_len)
-        self.w_2 = nn.Linear(seq_len, seq_len)
+        self.w_1 = nn.Linear(seq_len, hidden_dim)
+        self.v = nn.Linear(seq_len, hidden_dim)
+        self.w_2 = nn.Linear(hidden_dim, seq_len)
     def forward(
             self,
             x_n: torch.Tensor,
-            k: int,
     ):
         super().__init__()
         x_n = x_n.tranpose(-1,-2)
         return self.w_2(self.activation(self.w_1(x_n)) + self.v(x_n)).transpose(-1,-2)
 
+"""Transformer architecture"""
 
-"""
-VideoAnalysis Encoder
+class Transformer(nn.Module):
+	def __init__(
+			self,
+			encoder: nn.Module,
+			positional_encoding: nn.Module,
+			fc_layer: nn.Module,
+			num_layers: int = 4,
+	):
+		super().__init__()
+		self.pe = positional_encoding
+		self.encoder = nn.TransformerEncoder(
+			encoder, 
+			num_layers
+		)
+		self.fc = fc_layer
+	def forward(self, x_n):
+		out = self.pe(x_n)
+		out = self.encoder(out)
+		out = self.fc(out)
+		return out
+	#Only for L1
+	def forcing_forward(
+			self,
+			batch,
+			criterion,
+			noise_factor,
+	) -> tuple:
+		forcing_loss = 0
+		l1 = batch['l1']
+		l2 = batch['l2']
+		for rnn, residual_connection in zip(self.rnn, self.residual_connections):
+			l1 = residual_connection(l1, lambda x: rnn(x))
+			l2 = residual_connection(l2, lambda x: rnn(x))
+			forcing_loss += criterion(l1, l2, noise_factor)
+		return l1, forcing_loss	
 
-{PatchEmbedding (video-> patched feature 3D CNN wise/feature 2D CNN wise->positional encoding)
-->
-Spatio Temporal attention
-->
-Cross Attention
-->
-mlp} x N
-
-out
-
-"""
-
-class VideoAnalysisEncoderBlock(nn.Module):
-    def __init__(
-            self,
-            d_model: int,
-            num_heads: int,
-            dropout
-    ):
-        super().__init__()
-        self.attention = nn.ModuleList([
-            nn.MultiheadAttention(d_model, num_heads),
-            nn.MultiheadAttention(d_model, num_heads),
-        ])
-        self.mlp = PosWiseFFN(d_model)
-        self.residual_connections = nn.ModuleList([PreNormResidual(RootMeanSquaredNormalization(d_model), dropout) for _ in range(3)])
-    def self_attention(
-            self,
-            out
-    ):
-        return self.residual_connections[0](out, lambda x: self.attention[0](x,x,x))
-    def cross_attention(
-            self,
-            self_out,
-            cross_out
-    ):
-        """
-        Q: cross_out
-        K: self_out
-        V: self_out
-        """
-        return self.residual_connections[1](self_out, lambda x: self.attention[1](cross_out, x,x))
-    def poswise_mlp(
-            self,
-            out
-    ):
-        return self.residual_connections[2](out, lambda x: self.mlp(x))
-"""
-Timeseries Transfomer
-
-{
-embedding_layer,
-rotary positional encoding -> Dn positional encoding,
-time based self attention,
-cross attention,
-pos_wise_mlp + seq_wise_mlp,
-
-}
-
-"""
-class TimeseriesEmbeddingAndPositionalEncoding(nn.Module):
-    def __init__(
-            self,
-            input_size: int,
-            d_model: int,
-            seq_len: int,
-            delta_t: float,
-            degree: int
-
-    ):
-        if input_size != d_model:    
-            self.embedding_layer = nn.Linear(input_size, d_model, False)
-        self.rotary_pe = RotaryPositionalEncoding(d_model, seq_len)
-        self.delta_t = delta_t
-        self.degree = degree
-    def forward(
-            self,
-            x
-    ):
-        if self.embedding_layer is not None:    
-            x = self.embedding_layer(x)
-        x = self.rotary_pe(x)
-        x = DnPositionalEncoding(x, self.delta_t, self.degree)
-        return x
-    
-class TimeseriesTransformerEncoderBlock(nn.Module):
-    def __init__(
-            self,
-            d_model: int,
-            seq_len: int,
-            num_heads: int,
-            dropout: float
-    ):
-        super().__init__()
-        self.attention = nn.ModuleList([
-            ModedTimeSeriesAttention(d_model, num_heads),
-            ModedTimeSeriesAttention(d_model, num_heads),
-        ])
-        self.seqwise = SeqWiseMLP(seq_len, activation = nn.GELU())
-        self.poswise = PosWiseFFN(d_model, )
-        self.residual_connections = nn.ModuleList([PreNormResidual(RootMeanSquaredNormalization(d_model), dropout) for _ in range(3)])
-    def self_attention(
-            self,
-            x_n
-    ):
-        return self.residual_connections[0](x_n, lambda x: self.attention[0](x,x,x))
-    def cross_attention(
-            self,
-            self_out,
-            cross_out
-    ):
-        """
-        Q: cross_out
-        K: self_out
-        V: self_out
-        """
-        return self.residual_connections[1](self_out, lambda x: self.attention[1](cross_out, x,x))
-    def mlp(
-            self,
-            out
-    ):
-        return self.residual_connections[2](out, lambda x: self.poswise(x) + self.seqwise(x))    
-    def forward(self, x_n):
-        x_n = self.self_attention(x_n)
-        x_n = self.mlp(x_n)
-        return x_n
-    
-class TimeseriesTransformer(nn.Module):
-    def __init__(
-            self,
-            input_size: int,
-            d_model: int,
-            seq_len: int,
-            num_heads: int,
-            num_layers: int,
-            dropout: float,
-            delta_t: float,
-            degree: int,
-            fc_args: dict
-    ):
-        super().__init__()
-        self.embedding = TimeseriesEmbeddingAndPositionalEncoding(
-            input_size, d_model, seq_len, delta_t, degree
-        )
-
-        self.model = nn.TransformerEncoder(
-            TimeseriesTransformerEncoderBlock(d_model, seq_len, num_heads, dropout),
-            num_layers
-        )
-
-        self.fc = DeepNeuralNetwork(d_model, fc_args['out_size'], fc_args['arch'], fc_args['act'], fc_args['out_act'])
-    def feature_extraction(self, x_n):
-        x_n = self.embedding(x_n)
-        return self.model(x_n)
-        
-    def forward(self, x_n):
-        x_n = self.feature_extraction(x_n)
-        return self.fc(x_n)
-    def forcing_forward(
-            self,
-            batch,
-            criterion,
-            noise_factor,
-    ) -> tuple:
-        forcing_loss = 0
-        x_n_1 = torch.cat([batch['l1_ace'], batch['l1_dscovr']], dim = -1)
-        x_n_2 = torch.cat([batch['l2_ace'], batch['l2_dscovr']], dim = -1)
-        for _, encoder_layer in self.model.layers:
-            x_n_1 = encoder_layer(x_n_1)
-            x_n_2 = encoder_layer(x_n_2)
-            forcing_loss += criterion(x_n_1, x_n_2, noise_factor)
-        return x_n_1, forcing_loss
-    
-"""
-Multimodal Block:
-VideoAnalysisTransformer + TimeseriesTransformer
-"""
-
-class MultimodalTransformerEncoderBlock(nn.Module):
-    def __init__(
-            self,
-            VideoBlock_args: dict,
-            Timeseries_args: dict,
-    ):
-        super().__init__()
-        self.sdo_encoder = VideoAnalysisEncoderBlock(VideoBlock_args.d_model, VideoBlock_args.num_heads,
-                                              VideoBlock_args.dropout)
-        self.l1_encoder = TimeseriesTransformerEncoderBlock(Timeseries_args.d_model, Timeseries_args.seq_len,
-                                                            Timeseries_args.num_heads, Timeseries_args.dropout)
-    def forward(
-            self,
-            X,
-            x_n
-    ):
-        # Initial self attention layer
-        X = self.sdo_encoder.self_attention(X)
-        x_n = self.l1_encoder.self_attention(x_n)
-        # Cross attention layer
-        X_crossed = self.sdo_encoder.cross_attention(X,x_n)
-        x_n_crossed = self.l1_encoder.cross_attention(x_n, X)
-        #MLP
-        X = self.sdo_encoder.poswise_mlp(X_crossed)
-        x_n = self.l1_encoder.mlp(x_n_crossed)
-        return X, x_n
-    
-
-
-"""Multimodal backbone"""
-
-class MultimodalTransformer(nn.Module):
-    def __init__(
-            self, 
-            SDO_args: dict,
-            L1_args: dict,
-            fc_args: dict,
-            num_layers: int,
-    ):
-        super().__init__()
-        # 1. Instantiate the video model parameters
-        ## Patch embedding
-        self.SDO_embedding = PatchEmbed_3DCNN(SDO_args.d_model, SDO_args.h_div, SDO_args.w_div, 
-                                        RotaryPositionalEncoding(SDO_args.d_model, SDO_args.seq_len),
-                                        SDO_args.feature_extractor,
-                                        SDO_args.embed_arch['arch'],
-                                        SDO_args.embed_arch['act'],
-                                        SDO_args.dropout)
-        self.L1_embedding = TimeseriesEmbeddingAndPositionalEncoding(L1_args.input_size, L1_args.d_model,
-                                                                     L1_args.seq_len, L1_args.delta_t, L1_args.degree)
-        ## Encoder backbone
-        self.encoder = nn.TransformerEncoder(
-            MultimodalTransformerEncoderBlock(SDO_args, L1_args),
-            num_layers
-        )
-        ## Final Layer
-        self.fc = DeepNeuralNetwork(L1_args.d_model + SDO_args.d_model, fc_args.output_size, fc_args.architecture,
-                                    fc_args.hidden_activations, fc_args.out_activation)
-    def feature_extraction(
-            self,
-            X, 
-            x_n
-    ):
-        # Embedding, positional encoding, etc.
-        x_n = self.L1_embedding(x_n)
-        X = self.SDO_embedding(X)
-        # Backbone process
-        X, x_n = self.encoder(X, x_n)
-        # Concat and forward
-        return torch.cat([X, x_n], dim = -1)
-    def forward(
-            self,
-            batch
-    ):
-        x_n = torch.cat([batch['l1_ace'], batch['l1_dscovr']], dim = -1)
-        X = batch['sdo']
-        out = self.feature_extraction(X, x_n)
-        out = self.fc(out)
-        return out
-    def forcing_forward(
-            self,
-            batch,
-            criterion,
-            noise_factor,
-    ) -> tuple:
-        forcing_loss = 0
-        x_n_1 = torch.cat([batch['l1_ace'], batch['l1_dscovr']], dim = -1)
-        x_n_2 = torch.cat([batch['l2_ace'], batch['l2_dscovr']], dim = -1)
-        X = batch['sdo']
-        for _, encoder_layer in self.encoder.layer:
-            X, x_n_1 = encoder_layer(X, x_n_1)
-            X, x_n_2 = encoder_layer(X, x_n_2)
-            forcing_loss += criterion(x_n_1, x_n_2, noise_factor)
-        return torch.cat([X, x_n_1], dim = -1), forcing_loss
-
-"""
-Rnn Residual Encoder
-"""
-class RnnResidualEncoder(TrainingPhase):
-    def __init__(
-            self,
-            d_model,
-            rnn,
-            dropout: float = 0.1,
-            bidirectional: bool = False,
-            num_layers: int = 4,
-            output_size: int = 7,
-            architecture: tuple = (), 
-            hidden_activations: tuple = (),
-            out_activation: nn = None
-    ):
-        super().__init__()
-        assert (num_layers<6), 'Not aloud'
-        self.rnn =nn.ModuleList([rnn(d_model, d_model, 1, dropout, bidirectional) for _ in range(num_layers)]) 
-        self.residual_connections = nn.ModuleList([PreNormResidual(RootMeanSquaredNormalization(d_model), dropout)
-                                                   for _ in range(num_layers)])
-        self.fc = DeepNeuralNetwork(d_model, output_size, architecture, hidden_activations, out_activation)
-    def feature_extraction(
-            self,
-            x_n
-    ):
-        for rnn, residual_connection in zip(self.rnn, self.residual_connections):
-            x_n = residual_connection(x_n, lambda x: rnn(x))
-        return x_n
-    def forward(
-            self,
-            batch
-    ):
-        x_n = torch.cat([batch['ace'], batch['l1']], dim = -1)
-        x_n = self.feature_extraction(x_n)
-        x_n = self.fc(x_n)
-        return x_n
-    def forcing_forward(
-            self,
-            batch,
-            criterion,
-            noise_factor,
-    ) -> tuple:
-        forcing_loss = 0
-        x_n_1 = torch.cat([batch['l1_ace'], batch['l1_dscovr']], dim = -1)
-        x_n_2 = torch.cat([batch['l2_ace'], batch['l2_dscovr']], dim = -1)
-        for rnn, residual_connection in zip(self.rnn, self.residual_connections):
-            x_n_1 = residual_connection(x_n_1, lambda x: rnn(x))
-            x_n_2 = residual_connection(x_n_2, lambda x: rnn(x))
-            forcing_loss += criterion(x_n_1, x_n_2, noise_factor)
-        return x_n_1, forcing_loss
-
-        
-"""
-RNN based multimodal model
-image_extractor: MC3_18 3D CNN model
-l1_extractor: residual rnn model
-"""
-class MultimodalRnnModel(nn.Module):
-    def __init__(
-            self,
-            rnn_args,
-            conv_args,
-            fc_args,
-    ):
-        super().__init__()
-        self.l1_encoder = RnnResidualEncoder(rnn_args.d_model, rnn_args.rnn, rnn_args.dropout, rnn_args.bidirectional,
-                                             rnn_args.num_layers)
-        self.sdo_encoder = MC3_18(conv_args.hidden_state_size, conv_args.architecture, conv_args.hidden_activations,
-                                  conv_args.dropout)
-        self.fc = DeepNeuralNetwork(rnn_args.d_model + conv_args.hidden_state_size, 
-                                    fc_args.output_size, fc_args.architecture, fc_args.hidden_activations, fc_args.out_activation)
-
-    def feature_extraction(
-            self,
-            X,
-            x_n
-    ):
-        x_n = self.l1_encoder.feature_extraction(x_n)
-        X = self.sdo_encoder(X)
-        return torch.cat([X, x_n], dim = -1)
-    def forward(
-            self,
-            batch
-    ):
-        return self.fc(self.feature_extraction(batch['sdo'],batch['l1']))
-    def forcing_forward(
-            self,
-            batch,
-            forcing_criterion,
-            noise_factor
-    ) -> tuple:
-        x_n, forcing_loss = self.l1_encoder.forcing_forward(batch, forcing_criterion, noise_factor)
-        X = self.sdo_encoder(batch['sdo'])
-        return torch.cat([X, x_n], axis = -1), forcing_loss
-    
